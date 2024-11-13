@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+
+if [ -z "${1}" -o "${1}" = '-h' -o "${1}" = '--help' ]; then
+  echo "Usage: ${0} URL PATTERN CURLARGS"
+  echo
+  echo 'Await a PCRE pattern to match on a HTTP(S) response.'
+  echo 'The pattern can search within response headers and body.'
+  echo
+  echo 'We allow to pass additional cURL command arguments/flags.'
+  echo 'See `$ man curl` for further details.'
+  echo
+  echo 'A regular cURL output looks like this:'
+  echo "(prefix: '*' connection details, '>' prefix request headers,"
+  echo "'<' response headers, and at the end the response body)"
+  echo
+  echo '  *   Trying 54.228.128.120:80...'
+  echo '  * Connected to hausgold.de (54.228.128.120) port 80'
+  echo '  > GET / HTTP/1.1'
+  echo '  > Host: hausgold.de'
+  echo '  > User-Agent: curl/8.4.0'
+  echo '  > Accept: */*'
+  echo '  >'
+  echo '  < HTTP/1.1 301 Moved Permanently'
+  echo '  < Date: Fri, 15 Dec 2023 15:19:37 GMT'
+  echo '  < Content-Type: text/html'
+  echo '  < Content-Length: 169'
+  echo '  < Connection: keep-alive'
+  echo '  < Server: nginx/1.24.0'
+  echo '  < Location: https://www.hausgold.de/'
+  echo '  <'
+  echo '  <html>'
+  echo '  [..]'
+  echo '  </html>'
+  exit
+fi
+
+# $1 - the URL to request
+# $2 - the PCRE pattern
+# $3- - additional cURL arguments
+function check()
+{
+  curl -sv -H 'User-Agent: await-http-response' \
+    ${3} "${1}" 2>&1 \
+    | grep -iP "${2}" >/dev/null 2>&1 \
+      && echo 'true' \
+      || echo 'false'
+}
+
+URL="${1}"
+PATTERN="${2}"
+shift 2
+
+while [ "$(check "${URL}" "${PATTERN}" "${*}")" = 'false' ]; do
+  sleep 0.1
+done

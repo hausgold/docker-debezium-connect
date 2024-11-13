@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+#
+# Install our custom utilities
+
+# Any non-zero exit code will break
+set -e
+
+cp /build/utilities/* /bin/
+chmod +x /bin/*

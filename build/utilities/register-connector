@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+
+# Any non-zero exit code will break
+set -e
+set -o pipefail
+
+PROGNAME="$(basename "${0}")"
+
+# Print the usage/help information.
+function help()
+{
+  echo "Usage: ${PROGNAME} NAME [CONFIG]"
+  echo
+  echo 'Add or update a Kafka Connect connector.'
+  echo
+  echo 'Example:'
+  echo
+  echo "  ${PROGNAME} my-connector tasks.max=1"
+}
+
+if [ -z "${1}" -o "${1}" = '-h' -o "${1}" = '--help' ]; then
+  help
+  exit
+else
+  NAME="${1}"
+  shift
+fi
+
+# The default Kafka Connect REST API base URL (without trailing slash)
+REST_API_BASE_URL=${REST_API_BASE_URL:-'http://debezium-connect.local'}
+
+# The default configuration object, which can be extended
+CONNNECTOR_CONFIG=${CONNNECTOR_CONFIG:-"$(jo ${@})"}
+CONNNECTOR_CONFIG="$(echo "${CONNNECTOR_CONFIG}" | jq -c)"
+
+# Setup a tempfile which is automatically deleted on script exit
+TMP="$(mktemp)"
+function cleanup()
+{
+  rm -rf "${TMP}"
+}
+trap cleanup EXIT
+
+# Try to lookup a connector by name, when it exists we return its
+# configuration. Otherwise nothing will be returned.
+# See: https://bit.ly/4epFxOt
+#
+# $1 - the name of the connector
+function find-connector()
+{
+  URL="${REST_API_BASE_URL}/connectors/${NAME}/config"
+
+  curl --fail -sSL \
+    -H 'Accept: application/json' \
+    -H 'Content-Type:application/json' \
+    "${URL}" \
+    >"${TMP}" 2>&1 \
+    && cat "${TMP}" \
+    || true
+}
+
+# Create a new Kafka Connect connector.
+# See: https://bit.ly/3VeKPWn
+#
+# $1 - the name of the connector
+# $2 - the connector config
+function create-connector()
+{
+  URL="${REST_API_BASE_URL}/connectors"
+  BODY="$(jo name="${NAME}" config="${CONNNECTOR_CONFIG}")"
+
+  curl --fail-with-body -sSL \
+    -X POST \
+    -H 'Accept: application/json' \
+    -H 'Content-Type:application/json' \
+    -d "${BODY}" \
+    "${URL}" \
+    2>/dev/null
+}
+
+# Update an existing Kafka Connect connector, by name.
+# See: https://bit.ly/40Nh2aO
+#
+# $1 - the name of the connector
+# $2 - the connector config
+function update-connector()
+{
+  URL="${REST_API_BASE_URL}/connectors/${NAME}/config"
+  BODY="${CONNNECTOR_CONFIG}"
+
+  curl --fail-with-body -sSL \
+    -X PUT \
+    -H 'Accept: application/json' \
+    -H 'Content-Type:application/json' \
+    -d "${BODY}" \
+    "${URL}" \
+    2>/dev/null
+}
+
+if [ -z "$(find-connector)" ]; then
+  # Create a new connector
+  create-connector
+else
+  # Update the existing connector
+  update-connector
+fi

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+# Any non-zero exit code will break
+set -e
+set -o pipefail
+
+PROGNAME="$(basename "${0}")"
+
+# Print the usage/help information.
+function help()
+{
+  echo "Usage: ${PROGNAME} NAME [CONFIG]"
+  echo
+  echo 'Add or update a Kafka Connect connector for a PostgreSQL database.'
+  echo
+  echo 'Example:'
+  echo
+  echo "  ${PROGNAME} my-connector database.dbname=sourcedb tasks.max=1"
+}
+
+if [ -z "${1}" -o "${1}" = '-h' -o "${1}" = '--help' ]; then
+  help
+  exit
+else
+  NAME="${1}"
+  shift
+fi
+
+# The default configuration object, which can be extended
+CONNNECTOR_CONFIG="$(jo \
+  connector.class='io.debezium.connector.postgresql.PostgresConnector' \
+  plugin.name='pgoutput' \
+  tasks.max='1' \
+  snapshot.mode='initial' \
+  topic.creation.enable='true' \
+  topic.creation.default.replication.factor='1' \
+  topic.creation.default.partitions='1' \
+  topic.prefix='postgres' \
+  database.hostname='postgres.local' \
+  database.port='5432' \
+  database.user='postgres' \
+  database.password='postgres' \
+  database.dbname='postgres' \
+  ${@}
+)"
+export CONNNECTOR_CONFIG="$(echo "${CONNNECTOR_CONFIG}" | jq -c)"
+
+register-connector "${NAME}"

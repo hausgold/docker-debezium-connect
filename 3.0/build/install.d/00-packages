@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+# Any non-zero exit code will break
+set -e
+
+microdnf install -y \
+  hostname dbus-daemon avahi nss-mdns supervisor \
+  curl jo jq
+microdnf clean all
