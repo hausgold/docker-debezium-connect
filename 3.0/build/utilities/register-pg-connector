@@ -23,6 +23,7 @@ if [ -z "${1}" -o "${1}" = '-h' -o "${1}" = '--help' ]; then
   exit
 else
   NAME="${1}"
+  SLOT_NAME="$(echo "debezium_${NAME}" | sed 's/[^a-z0-9_]/_/gi' | cut -c1-63)"
   shift
 fi
 
@@ -41,6 +42,8 @@ CONNNECTOR_CONFIG="$(jo \
   database.user='postgres' \
   database.password='postgres' \
   database.dbname='postgres' \
+  slot.name="${SLOT_NAME}" \
+  publication.name="${SLOT_NAME}" \
   signal.enabled.channels='source' \
   signal.data.collection='public.debezium_signals' \
   ${@}
