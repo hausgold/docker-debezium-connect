@@ -41,6 +41,8 @@ CONNNECTOR_CONFIG="$(jo \
   database.user='postgres' \
   database.password='postgres' \
   database.dbname='postgres' \
+  signal.enabled.channels='source' \
+  signal.data.collection='public.debezium_signals' \
   ${@}
 )"
 export CONNNECTOR_CONFIG="$(echo "${CONNNECTOR_CONFIG}" | jq -c)"
