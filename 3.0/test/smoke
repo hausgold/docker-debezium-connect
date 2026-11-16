@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+PROGNAME="$(basename "${0}")"
+
+# Print the usage of the script.
+function help()
+{
+  cat <<EOF
+Usage: ${PROGNAME} IMAGE [NAME]
+
+Run the smoke test on a built Docker image. The image is started with
+its default configuration, next to a Kafka broker and a PostgreSQL
+database which it finds via mDNS. A connector is registered with the
+defaults of the image, and a row change has to arrive on the broker. A
+second container of the same image acts as the client, it looks the
+service up via mDNS and reads the connectors, directly and through the
+proxy. NAME prefixes the containers and names the network of the test
+run, it defaults to debezium-connect-test.
+
+Eg. ${0} hausgold/debezium-connect:latest
+EOF
+}
+
+if [ -z "${1:-}" -o "${1:-}" = '-h' -o "${1:-}" = '--help' ]; then
+  help
+  exit 0
+fi
+
+# Print an error message and the usage to stderr, then exit.
+#
+# $1 - the error message
+function panic()
+{
+  >&2 echo "${PROGNAME}: ${1}"
+  >&2 echo -e '\n---\n'
+  >&2 help
+  exit 1
+}
+
+command -v docker >/dev/null || panic 'docker: command not found'
+
+# The Docker image to test
+IMAGE="${1}"
+# The name prefix of the containers, and the name of the network
+NAME="${2:-debezium-connect-test}"
+# The container which runs the default configuration
+SERVER="${NAME}-server"
+# The container which looks up and connects to the service
+CLIENT="${NAME}-client"
+# The container of the broker which receives the change events
+KAFKA="${NAME}-kafka"
+# The container of the database whose changes are captured
+POSTGRES="${NAME}-postgres"
+# We use a dedicated network, so that containers of other projects cannot
+# claim the mDNS hostnames of the test run on the default bridge
+NETWORK="${NAME}"
+# The broker and database images, whose defaults (kafka.local:9092 and
+# postgres.local:5432) are the ones the image looks for by default
+KAFKA_IMAGE='hausgold/kafka:4.2'
+POSTGRES_IMAGE='hausgold/postgres:18.7'
+# The default of the image, as documented on the readme
+MDNS_HOSTNAME='debezium-connect.local'
+# The REST API port, and the proxy port in front of it
+PORTS=(8083 80)
+# The connector which is registered for the test
+CONNECTOR='smoke'
+# The table whose changes are captured, and the topic they arrive on
+TABLE='smoke'
+TOPIC="postgres.public.${TABLE}"
+# The value of the row which is inserted into the table
+ROW='captured'
+# The seconds we wait for the startups, and for the mDNS lookup
+TIMEOUT=180
+
+# Remove the containers and the network of the test run.
+function cleanup()
+{
+  docker rm --force --volumes \
+    "${SERVER}" "${CLIENT}" "${KAFKA}" "${POSTGRES}" >/dev/null 2>&1 || true
+  docker network rm "${NETWORK}" >/dev/null 2>&1 || true
+}
+
+# Print the failed check together with the latest logs of a container to
+# stderr, then exit.
+#
+# $1 - the description of the failed check
+# $2 - the container to print the logs of, the service by default
+function fail()
+{
+  >&2 echo "${PROGNAME}: ${1}"
+  >&2 echo -e '\n---\n'
+  >&2 docker logs --tail 50 "${2:-${SERVER}}" || true
+  exit 1
+}
+
+# Retry a command every second until it succeeds, or the timeout is
+# reached.
+#
+# $1 - the timeout in seconds
+# $@ - the command to run
+function wait-for()
+{
+  local deadline=$((SECONDS + ${1}))
+  shift
+
+  until "${@}" >/dev/null 2>&1; do
+    [ "${SECONDS}" -lt "${deadline}" ] || return 1
+    sleep 1
+  done
+}
+
+# Send a HTTP request from within a container and print the response
+# body. Error responses of the server fail the request.
+#
+# $1 - the container name
+# $@ - the curl arguments, at least the URL
+function request()
+{
+  local container="${1}"
+  shift
+
+  docker exec "${container}" \
+    curl --fail --silent --show-error --max-time 10 "${@}"
+}
+
+# Run a SQL statement on the database via its local socket.
+#
+# $1 - the SQL statement
+function sql()
+{
+  docker exec "${POSTGRES}" psql -U postgres -c "${1}"
+}
+
+# Check whether the broker accepts connections on its client port, which
+# it opens at the very end of its startup.
+function kafka-ready()
+{
+  docker exec "${KAFKA}" bash -c ': < /dev/tcp/127.0.0.1/9092'
+}
+
+# Check whether the database accepts connections. We ask via TCP, because
+# the bootstrapping server of the first start listens on the local socket
+# only and would report ready too early.
+function postgres-ready()
+{
+  docker exec "${POSTGRES}" pg_isready -h 127.0.0.1
+}
+
+# Check whether the service lists its connectors. It only does so after
+# it reached the broker and joined its own cluster.
+function server-ready()
+{
+  request "${SERVER}" "http://127.0.0.1:${PORTS[0]}/connectors"
+}
+
+# Check whether the client resolves the mDNS hostname to the address of
+# the service. The image ships no avahi tools, so we ask the name service
+# of the container. Neither its hosts file nor the DNS of the network
+# know the hostname, which leaves mDNS as the source.
+function mdns-resolves()
+{
+  local address
+  address="$(
+    docker exec "${CLIENT}" getent ahostsv4 "${MDNS_HOSTNAME}" \
+      | awk 'NR == 1 { print $1 }'
+  )"
+  [ "${address}" = "${SERVER_ADDRESS}" ]
+}
+
+# Print the state of the first task of the test connector, parsed with
+# the jq of the image.
+function task-state()
+{
+  request "${SERVER}" \
+    "http://127.0.0.1:${PORTS[0]}/connectors/${CONNECTOR}/status" \
+    | docker exec -i "${SERVER}" jq -r '.tasks[0].state'
+}
+
+# Check whether the task of the test connector is running.
+function connector-running()
+{
+  [ "$(task-state)" = 'RUNNING' ]
+}
+
+# Check whether the change event of the test row arrived on the broker.
+# The topic does not exist before the first event, so a failing consumer
+# just means there is nothing yet.
+function row-captured()
+{
+  local events
+  events="$(
+    docker exec "${KAFKA}" \
+      timeout 15 kcat -C -t "${TOPIC}" -o beginning -e -q || true
+  )"
+  grep -qF "\"name\":\"${ROW}\"" <<< "${events}"
+}
+
+# Drop the leftovers of an aborted run, and clean up after this one
+cleanup
+trap cleanup EXIT
+
+echo "Start ${KAFKA_IMAGE} as the broker of the service"
+docker network create "${NETWORK}" >/dev/null
+# The broker only carries a handful of events, so we keep its memory
+# footprint low
+docker run --detach --name "${KAFKA}" --network "${NETWORK}" \
+  --env KAFKA_HEAP_OPTS='-Xmx256M -Xms32M' "${KAFKA_IMAGE}" >/dev/null
+wait-for "${TIMEOUT}" kafka-ready \
+  || fail 'The broker did not open its client port' "${KAFKA}"
+
+echo "Start ${POSTGRES_IMAGE} as the database to capture"
+docker run --detach --name "${POSTGRES}" --network "${NETWORK}" \
+  "${POSTGRES_IMAGE}" >/dev/null
+wait-for "${TIMEOUT}" postgres-ready \
+  || fail 'The database did not accept connections' "${POSTGRES}"
+# The connector defaults of the image expect the signaling table, next
+# to it we create the table whose changes we want to see
+sql 'CREATE TABLE debezium_signals (
+       id varchar(42) PRIMARY KEY, type varchar(32) NOT NULL,
+       data varchar(2048))' >/dev/null \
+  || fail 'The signaling table could not be created' "${POSTGRES}"
+sql "CREATE TABLE ${TABLE} (id integer PRIMARY KEY, name text)" >/dev/null \
+  || fail 'The table to capture could not be created' "${POSTGRES}"
+
+echo "Start ${IMAGE} with the default configuration"
+docker run --detach --name "${SERVER}" --network "${NETWORK}" \
+  "${IMAGE}" >/dev/null
+# The service resolves the broker by its mDNS hostname on its own, so
+# this also covers the name service within the image
+wait-for "${TIMEOUT}" server-ready \
+  || fail 'The service did not list its connectors on the REST API'
+
+echo "Look up ${MDNS_HOSTNAME} via mDNS"
+# The client needs its own mDNS hostname, otherwise both containers
+# would claim the default one. It runs without the service, because a
+# second worker would join the cluster of the first and trigger a
+# rebalance in the middle of the test.
+docker run --detach --name "${CLIENT}" --network "${NETWORK}" \
+  --env MDNS_HOSTNAME="${CLIENT}.local" "${IMAGE}" \
+  sh -c 'rm /etc/supervisord.d/debezium-connect.ini \
+    && exec /usr/bin/supervisord -nc /etc/supervisord.conf' >/dev/null
+SERVER_ADDRESS="$(docker inspect "${SERVER}" \
+  --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')"
+wait-for "${TIMEOUT}" mdns-resolves \
+  || fail "${MDNS_HOSTNAME} did not resolve to ${SERVER_ADDRESS}"
+
+echo 'Register a connector with the defaults of the image'
+# The utility of the image talks to the proxy by the mDNS hostname, and
+# its defaults send the connector to postgres.local on its own
+docker exec "${SERVER}" register-pg-connector "${CONNECTOR}" >/dev/null \
+  || fail 'The connector could not be registered'
+wait-for 60 connector-running \
+  || fail "The connector task is not running: $(task-state 2>&1 || true)"
+
+echo 'Capture a row change on the broker'
+sql "INSERT INTO ${TABLE} VALUES (1, '${ROW}')" >/dev/null \
+  || fail 'The row could not be inserted' "${POSTGRES}"
+wait-for 60 row-captured \
+  || fail "The row change did not arrive on the topic ${TOPIC}"
+
+for PORT in "${PORTS[@]}"; do
+  echo "Connect to ${MDNS_HOSTNAME} on port ${PORT}"
+  CONNECTORS="$(
+    request "${CLIENT}" "http://${MDNS_HOSTNAME}:${PORT}/connectors"
+  )" || fail "The client could not connect to the service on port ${PORT}"
+  [ "${CONNECTORS}" = "[\"${CONNECTOR}\"]" ] \
+    || fail "Port ${PORT} returned unexpected connectors: ${CONNECTORS}"
+done
+
+echo 'Check the CORS headers of the proxy'
+HEADERS="$(
+  request "${CLIENT}" --output /dev/null --dump-header - \
+    "http://${MDNS_HOSTNAME}:${PORTS[1]}/connectors"
+)" || fail 'The client could not read the response headers of the proxy'
+grep -qi '^access-control-allow-origin: \*' <<< "${HEADERS}" \
+  || fail "The proxy did not send the CORS headers: ${HEADERS}"
+
+echo 'All checks passed'
